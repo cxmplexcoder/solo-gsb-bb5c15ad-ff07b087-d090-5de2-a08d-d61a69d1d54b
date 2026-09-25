@@ -39,6 +39,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
 | POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
 | POST | `/api/focus-searches` | 光线只追迹一次，沿观察线单位法线等距平移扫描光斑质心/RMS，对命中集合相同的低谷黄金分割细化，返回 RMS 最小的焦点位置（不入库） |
+| POST | `/api/refractive-index-calibrations` | 固定其余界面只替换目标界面的 n_next，沿观察线单位切向量比对实测偏移，41 点等距扫描加低谷黄金分割细化，返回均方残差最小的折射率与逐光线残差（不入库） |
 
 ### 请求示例
 
@@ -699,12 +700,96 @@ curl -X POST http://localhost:8000/api/focus-searches \
 
 服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
 
+## 折射率标定（按观察线切向偏移反演目标界面折射率）
+
+`POST /api/refractive-index-calibrations` 接收公共**起点**、起始折射率 `n_start`、**至少两条**样本光线（每条含发射方向 `direction` 与其在观察线上的**实测有符号切向偏移** `measured_offset`）、按顺序排列的界面、**待标定界面序号** `target_interface_index`（从 0 起）、观察线与**正折射率上下界** `n_lower < n_upper`，固定其余界面参数、只替换目标界面的 `n_next` 做最小二乘标定。该接口为即时计算，结果不写入数据库。
+
+- **预测偏移**：观察线法线归一化后**逆时针旋转 90°** 得单位切向量 `t = (-ny, nx)`（响应回显为 `tangent`）；每个候选折射率下逐条复用顺序界面追迹与观察线求交，`predicted_offset = (观察线前向交点 − 观察线给定点) · t`，逐光线 `residual = predicted_offset − measured_offset`。
+- **候选有效性**：仅当**所有样本光线**均追迹完成（`completed`）且出射段与观察线存在**前向交点**时该候选有效，均方残差 `mean_squared_residual = Σ residual² / 光线数`；任一光线全反射、漏过界面或未前向命中观察线，该候选即无效（不参与取最小）。
+- **等距扫描**：在闭区间 `[n_lower, n_upper]`（含端点）等间距扫描 **41** 个折射率候选。
+- **低谷黄金分割细化**：对**连续三个有效**扫描点，若中间点均方残差**不高于**两端，则在两端点之间按黄金分割法细化，**最多 24 轮**（首轮取两个内点 `lo+0.382·L`、`lo+0.618·L`，此后每轮只新算一个内点）；细化试点一旦**失效**即**停止该低谷**并保留此前全部有效试点，不跨无效扫描点构造低谷。
+- **最佳选取**：以所有有效扫描点与细化点中均方残差最小者为最优折射率，**平局取较小折射率**；区间内无任何有效候选时 `solvable` 为 `false`、`best` 为 `null`，并在 `no_solution_reason` 给出明确原因。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/refractive-index-calibrations` | 只替换目标界面 n_next，41 点等距扫描 + 低谷黄金分割细化，返回最优折射率、均方残差与逐光线预测偏移/残差（不入库） |
+
+### 折射率标定请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/refractive-index-calibrations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "n_start": 1.0,
+    "rays": [
+      {"direction": {"x": 1, "y": -0.12}, "measured_offset": -1.124895847059123},
+      {"direction": {"x": 1, "y": 0.05}, "measured_offset": 0.4689203568330044},
+      {"direction": {"x": 1, "y": 0.18}, "measured_offset": 1.68619328627977}
+    ],
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "target_interface_index": 0,
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "n_lower": 1.0,
+    "n_upper": 2.0
+  }'
+```
+
+### 折射率标定响应说明
+
+```json
+{
+  "target_interface_index": 0,
+  "n_lower": 1.0,
+  "n_upper": 2.0,
+  "scan_count": 41,
+  "ray_count": 3,
+  "tangent": {"x": 0.0, "y": 1.0},
+  "scan": [
+    {"n_next": 1.0, "valid": true, "mean_squared_residual": 0.006519515365384245},
+    {"n_next": 1.025, "valid": true, "mean_squared_residual": 0.005525800842710689}
+  ],
+  "refined": [
+    {"n_next": 1.4409830056250525, "mean_squared_residual": 1.880370206101635e-06}
+  ],
+  "solvable": true,
+  "no_solution_reason": null,
+  "best": {
+    "n_next": 1.45,
+    "mean_squared_residual": 0.0,
+    "rays": [
+      {
+        "direction": {"x": 1.0, "y": -0.12},
+        "measured_offset": -1.124895847059123,
+        "status": "completed",
+        "reason": null,
+        "observation_point": {"x": 10.0, "y": -1.124895847059123},
+        "predicted_offset": -1.124895847059123,
+        "residual": 0.0
+      }
+    ]
+  }
+}
+```
+
+- `scan_count` 恒为 41；`ray_count` 为样本光线数（至少 2）。
+- `scan[]` 按折射率从 `n_lower` 到 `n_upper` 等距排列（含端点），每项含 `n_next`、`valid`（全部光线追迹完成且前向命中观察线）与 `mean_squared_residual`（无效时为 `null`）。
+- `refined[]`：各低谷黄金分割细化得到的有效试点（`n_next` 与 `mean_squared_residual`），按折射率升序；未触发任何低谷细化时为空列表。
+- `best`：最优折射率 `n_next`、对应的 `mean_squared_residual` 与逐光线结果 `rays[]`（回显发射方向与实测偏移，另含追迹 `status` / `reason`、`observation_point`、`predicted_offset`、`residual`）。
+- **无解**：区间内不存在使全部样本光线有效 的候选时 `solvable = false`、`no_solution_reason` 给出明确原因、`best` 为 `null`（`scan` 仍正常返回，便于排查失效区间）。
+- 参数校验：`rays` 少于 2 条、`n_lower`/`n_upper` 非正、`n_lower >= n_upper`、`target_interface_index` 越界或方向为零向量均返回 `422`。
+
+服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
+
 ## 项目结构
 
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、折射率标定（只替换目标界面 n_next，41 点等距扫描 + 低谷黄金分割细化取均方残差最小）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型

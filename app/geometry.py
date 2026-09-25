@@ -20,6 +20,9 @@ AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
 FOCUS_MIN_HITS = 2  # 扫描/细化位置有效所需的最少命中光线数
 FOCUS_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
 
+CALIBRATION_SCAN_COUNT = 41  # 折射率标定：区间含端点等距扫描点数
+CALIBRATION_MAX_ROUNDS = 24  # 折射率标定：单个低谷黄金分割细化的最多轮数
+
 WAVEFRONT_MIN_FIT_RAYS = 3  # 波前光程直线拟合所需的最少有效光线数
 # 黄金分割内点位置：左内点系数 1/φ²≈0.381966，右内点系数 1/φ≈0.618034
 _GOLDEN_TAU = (math.sqrt(5.0) - 1.0) / 2.0  # 1/φ ≈ 0.618034
@@ -791,4 +794,221 @@ def focus_search(
             for _shift, p in refined_points
         ],
         "best": best,
+    }
+
+
+@dataclass
+class _CalibrationPoint:
+    """待标定界面折射率取某候选值时的全体光线评估结果。
+
+    所有样本光线均追迹完成且与观察线存在前向交点时 valid 为 True；
+    mean_squared_residual 为逐光线残差平方的均值；offsets 为各光线沿观察线
+    单位切向量的预测有符号偏移；residuals 为对应残差（预测偏移 − 实测偏移）；
+    无效时后三者为 None。
+    """
+
+    n_value: float
+    valid: bool
+    ray_results: list[
+        tuple[str, str | None, tuple[float, float] | None, float | None, float | None]
+    ]  # 逐光线 (status, reason, observation_point, offset, residual)
+    mean_squared_residual: float | None
+
+
+def calibrate_refractive_index(
+    start: tuple[float, float],
+    ray_inputs: list[tuple[tuple[float, float], float]],
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    target_interface_index: int,
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    n_lower: float,
+    n_upper: float,
+) -> dict:
+    """固定其余界面，只替换目标界面 n_next，按观察线切向偏移残差标定折射率。
+
+    对每个候选折射率 n，构造一组与 interfaces 相同的顺序界面，仅将序号
+    target_interface_index 的 n_next 替换为 n（其余界面点、法线、折射率不变），
+    逐条复用 trace_ray 追迹并取最终出射段与观察线的前向交点。观察线法线归一化
+    后逆时针旋转 90° 得单位切向量 t，预测偏移 = (交点 − obs_point) · t，残差 =
+    预测偏移 − 实测偏移。仅当**所有样本光线**均追迹完成（completed）且前向命中
+    观察线时该候选有效，均方残差 = 逐光线残差平方的均值；任一光线全反射、漏过
+    界面或无观察线前向交点时该候选无效。
+
+    在 [n_lower, n_upper]（正折射率，含端点）等间距扫描 CALIBRATION_SCAN_COUNT
+    （41）个候选；对连续三个有效扫描点，若中间点均方残差不高于两端，则在两端点
+    之间按黄金分割法细化，最多 CALIBRATION_MAX_ROUNDS（24）轮（首轮取两个内点，
+    之后每轮只新算一个内点）。细化试点一旦失效即停止该低谷，此前得到的有效试点
+    全部保留；不跨无效扫描点构造低谷。
+
+    以所有有效扫描点与细化点中均方残差最小者为最佳，平局取较小折射率；没有任何
+    有效候选时 best 为 None 并给出原因。该函数为即时计算，不写入数据库。
+
+    返回 dict：
+      tangent / ray_count / target_interface_index / n_lower / n_upper /
+      scan_count；
+      scan:    [(n, valid, mean_squared_residual|None), ...]（按 n 升序，含无效点）；
+      refined: [(n, mean_squared_residual), ...]（有效细化点，按 n 升序）；
+      best:    (n, mean_squared_residual, ray_results) 或 None；
+      no_solution_reason: 无有效候选时的原因，否则 None。
+    """
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    cache: dict[float, _CalibrationPoint] = {}
+
+    def evaluate(n_value: float) -> _CalibrationPoint:
+        """替换目标界面折射率后逐条追迹，求预测偏移、残差与均方残差；同值只算一次。"""
+        if n_value in cache:
+            return cache[n_value]
+        trial_interfaces = [
+            (point, normal, n_value if i == target_interface_index else n_next)
+            for i, (point, normal, n_next) in enumerate(interfaces)
+        ]
+        ray_results: list[
+            tuple[str, str | None, tuple[float, float] | None, float | None, float | None]
+        ] = []
+        offsets: list[float] = []
+        residuals: list[float] = []
+        all_valid = True
+        for direction, measured_offset in ray_inputs:
+            segments, status, reason = trace_ray(
+                start, direction, n_start, trial_interfaces
+            )
+            if status != "completed":
+                all_valid = False
+                ray_results.append((status, reason, None, None, None))
+                continue
+            point = observation_intersection(segments, obs_point, obs_normal)
+            if point is None:
+                all_valid = False
+                ray_results.append(
+                    (
+                        "no_observation_intersection",
+                        "出射段与观察线平行，或交点位于光线反方向",
+                        None,
+                        None,
+                        None,
+                    )
+                )
+                continue
+            offset = _dot((point[0] - obs_point[0], point[1] - obs_point[1]), tangent)
+            residual = offset - measured_offset
+            offsets.append(offset)
+            residuals.append(residual)
+            ray_results.append(("completed", None, point, offset, residual))
+        msr = (
+            sum(r * r for r in residuals) / len(residuals)
+            if all_valid
+            else None
+        )
+        result = _CalibrationPoint(n_value, all_valid, ray_results, msr)
+        cache[n_value] = result
+        return result
+
+    # 等距扫描（含端点）
+    scan_points: list[_CalibrationPoint] = []
+    last = CALIBRATION_SCAN_COUNT - 1
+    for i in range(CALIBRATION_SCAN_COUNT):
+        n_value = (
+            n_lower
+            if i == 0
+            else n_lower + (n_upper - n_lower) * i / last
+        )
+        scan_points.append(evaluate(n_value))
+
+    # 细化点池：仅记录非扫描位置的有效试点；相邻低谷可能探到同一 n，集合去重
+    refined_points: list[tuple[float, _CalibrationPoint]] = []
+    refined_values: set[float] = set()
+    scan_values = {p.n_value for p in scan_points}
+
+    def probe(n_value: float) -> _CalibrationPoint | None:
+        """细化试点：有效则保留并返回；失效时返回 None（该低谷随即停止）。"""
+        point = evaluate(n_value)
+        if point.valid and n_value not in scan_values and n_value not in refined_values:
+            refined_values.add(n_value)
+            refined_points.append((n_value, point))
+        if not point.valid:
+            return None
+        return point
+
+    # 连续三个有效扫描点构成低谷：msr[mid] <= msr[lo] 且 <= msr[hi]
+    for i in range(len(scan_points) - 2):
+        p0, p1, p2 = scan_points[i], scan_points[i + 1], scan_points[i + 2]
+        if not (p0.valid and p1.valid and p2.valid):
+            continue  # 不跨无效扫描点
+        if not (
+            p1.mean_squared_residual <= p0.mean_squared_residual
+            and p1.mean_squared_residual <= p2.mean_squared_residual
+        ):
+            continue
+
+        lo, hi = p0.n_value, p2.n_value
+        # 左内点 a = lo + 0.382L，右内点 b = lo + 0.618L
+        a = lo + _GOLDEN_1MTAU * (hi - lo)
+        b = lo + _GOLDEN_TAU * (hi - lo)
+        fa = fb = None
+        for round_i in range(CALIBRATION_MAX_ROUNDS):
+            if round_i == 0:
+                # 首轮取两个内点；任一试点失效即停止，不再算另一个
+                fa = probe(a)
+                if fa is None:
+                    break
+                fb = probe(b)
+                if fb is None:
+                    break
+                continue
+            # 后续每轮只新算一个内点，另一个由上轮幸存点复用
+            if fa.mean_squared_residual <= fb.mean_squared_residual:
+                # 最小点偏左：新区间 [lo, b]；幸存点 a 变为新左内点，新算右内点
+                hi = b
+                b, fb = a, fa
+                a = lo + _GOLDEN_1MTAU * (hi - lo)
+                fa = probe(a)
+            else:
+                # 最小点偏右：新区间 [a, hi]；幸存点 b 变为新右内点，新算左内点
+                lo = a
+                a, fa = b, fb
+                b = lo + _GOLDEN_TAU * (hi - lo)
+                fb = probe(b)
+            if fa is None or fb is None:
+                break
+
+    # 以均方残差最小为最佳，平局取较小折射率
+    candidates: list[tuple[float, _CalibrationPoint]] = [
+        (p.n_value, p) for p in scan_points if p.valid
+    ]
+    candidates.extend(refined_points)
+    best: tuple[float, float, list] | None = None
+    if candidates:
+        best_n, best_point = min(
+            candidates,
+            key=lambda item: (item[1].mean_squared_residual, item[0]),
+        )
+        best = (best_n, best_point.mean_squared_residual, best_point.ray_results)
+
+    no_solution_reason = None
+    if best is None:
+        no_solution_reason = (
+            f"折射率区间 [{n_lower}, {n_upper}] 内不存在使全部 {len(ray_inputs)} "
+            "条样本光线均追迹完成且前向命中观察线的候选，无法标定"
+        )
+
+    refined_points.sort(key=lambda item: item[0])
+    return {
+        "tangent": tangent,
+        "ray_count": len(ray_inputs),
+        "target_interface_index": target_interface_index,
+        "n_lower": n_lower,
+        "n_upper": n_upper,
+        "scan_count": CALIBRATION_SCAN_COUNT,
+        "scan": [
+            (p.n_value, p.valid, p.mean_squared_residual) for p in scan_points
+        ],
+        "refined": [
+            (n_value, p.mean_squared_residual) for n_value, p in refined_points
+        ],
+        "best": best,
+        "no_solution_reason": no_solution_reason,
     }

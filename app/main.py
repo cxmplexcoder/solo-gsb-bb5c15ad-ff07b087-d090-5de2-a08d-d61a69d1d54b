@@ -30,6 +30,10 @@ POST /api/alignment-sensitivities     基准追迹后逐界面将法线旋转 ±
 POST /api/focus-searches              光线只追迹一次，将观察线沿单位法线等距平移
                                       扫描光斑质心/RMS，对命中集合相同的低谷区间
                                       黄金分割细化，返回 RMS 最小的焦点位置（不入库）
+POST /api/refractive-index-calibrations
+                                      固定其余界面，只替换目标界面的 n_next，沿观察
+                                      线单位切向量比对实测偏移，41 点等距扫描加低谷
+                                      黄金分割细化，取均方残差最小的折射率（不入库）
 """
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ from .comparison import compare_trace_records
 from .geometry import (
     aim_solutions,
     alignment_sensitivities,
+    calibrate_refractive_index,
     centroid_and_rms,
     focus_search,
     linear_least_squares,
@@ -69,6 +74,8 @@ from .schemas import (
     FocusSearchRequest,
     PowerEvaluationOut,
     PowerRequest,
+    RefractiveIndexCalibrationOut,
+    RefractiveIndexCalibrationRequest,
     SegmentOut,
     SensitivityRequest,
     TraceCompareRequest,
@@ -711,6 +718,98 @@ def compute_focus_searches(req: FocusSearchRequest) -> dict:
                     "y": result["best"][1][1],
                 },
                 "rms_radius": result["best"][2],
+            }
+        ),
+    }
+
+
+@app.post(
+    "/api/refractive-index-calibrations",
+    response_model=RefractiveIndexCalibrationOut,
+)
+def compute_refractive_index_calibration(
+    req: RefractiveIndexCalibrationRequest,
+) -> dict:
+    """固定其余界面只替换目标界面 n_next，按观察线切向偏移残差标定折射率。
+
+    所有样本光线共用同一 起点 与起始折射率；每条样本给出发射方向与其在观察线上
+    实测命中点沿单位切向量（观察线法线逆时针旋转 90°）的有符号偏移。对折射率闭
+    区间 [n_lower, n_upper]（正折射率，含端点）等距扫描 41 个候选，仅当全部样本
+    光线均追迹完成（completed）且出射段前向命中观察线时该候选有效，逐光线残差 =
+    预测偏移 − 实测偏移，均方残差为残差平方均值。
+
+    对连续三个有效扫描点，若中间点均方残差不高于两端，则在两端点之间按黄金分割
+    法细化，最多 24 轮；细化试点一旦失效（任一光线追迹失败或未前向命中观察线）
+    即停止该低谷，此前的有效试点全部保留。以所有有效扫描点与细化点中均方残差
+    最小者为最佳，平局取较小折射率；区间内无有效候选时 solvable 为 false、best
+    为 null 并返回明确原因。该接口为即时计算，结果不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    ray_inputs = [
+        (ray.direction.as_tuple(), ray.measured_offset) for ray in req.rays
+    ]
+    result = calibrate_refractive_index(
+        req.start.as_tuple(),
+        ray_inputs,
+        req.n_start,
+        interfaces,
+        req.target_interface_index,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.n_lower,
+        req.n_upper,
+    )
+    tangent = result["tangent"]
+    best = result["best"]
+    return {
+        "target_interface_index": result["target_interface_index"],
+        "n_lower": result["n_lower"],
+        "n_upper": result["n_upper"],
+        "scan_count": result["scan_count"],
+        "ray_count": result["ray_count"],
+        "tangent": {"x": tangent[0], "y": tangent[1]},
+        "scan": [
+            {
+                "n_next": n_value,
+                "valid": valid,
+                "mean_squared_residual": msr,
+            }
+            for n_value, valid, msr in result["scan"]
+        ],
+        "refined": [
+            {"n_next": n_value, "mean_squared_residual": msr}
+            for n_value, msr in result["refined"]
+        ],
+        "solvable": best is not None,
+        "no_solution_reason": result["no_solution_reason"],
+        "best": (
+            None
+            if best is None
+            else {
+                "n_next": best[0],
+                "mean_squared_residual": best[1],
+                "rays": [
+                    {
+                        "direction": {
+                            "x": ray_in.direction.x,
+                            "y": ray_in.direction.y,
+                        },
+                        "measured_offset": ray_in.measured_offset,
+                        "status": run[0],
+                        "reason": run[1],
+                        "observation_point": (
+                            None
+                            if run[2] is None
+                            else {"x": run[2][0], "y": run[2][1]}
+                        ),
+                        "predicted_offset": run[3],
+                        "residual": run[4],
+                    }
+                    for ray_in, run in zip(req.rays, best[2])
+                ],
             }
         ),
     }

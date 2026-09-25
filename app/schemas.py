@@ -449,3 +449,104 @@ class FocusSearchOut(BaseModel):
     scan: list[FocusScanPointOut]
     refined: list[FocusRefinedPointOut]
     best: FocusBestOut | None
+
+
+class CalibrationRayIn(BaseModel):
+    """一个标定样本：发射方向与其在观察线上的实测有符号切向偏移。
+
+    实测偏移沿观察线单位切向量（法线逆时针旋转 90°）相对观察线给定点计量。
+    """
+
+    direction: Vec2
+    measured_offset: float = Field(
+        allow_inf_nan=False, description="观察线上的实测有符号切向偏移，必须为有限值"
+    )
+
+    @field_validator("direction")
+    @classmethod
+    def direction_nonzero(cls, v: Vec2) -> Vec2:
+        if math.hypot(v.x, v.y) < _EPS:
+            raise ValueError("方向不能为零向量")
+        return v
+
+
+class RefractiveIndexCalibrationRequest(BaseModel):
+    """折射率标定请求：多条带实测偏移的发射光线、顺序界面、待标定界面序号与
+    正折射率搜索上下界。
+
+    标定时固定其余界面，只将 target_interface_index 对应界面的 n_next 替换为
+    候选折射率；要求至少两条样本光线、至少一个界面，且 0 < n_lower < n_upper。
+    """
+
+    start: Vec2
+    rays: list[CalibrationRayIn] = Field(min_length=2, description="标定样本，至少两条")
+    n_start: float = Field(gt=0, description="起始介质折射率，必须为正")
+    interfaces: list[InterfaceIn] = Field(min_length=1)
+    observation_line: ObservationLineIn
+    target_interface_index: int = Field(
+        ge=0, description="待标定界面序号（从 0 起），只替换该界面的 n_next"
+    )
+    n_lower: float = Field(
+        gt=0, allow_inf_nan=False, description="候选折射率下界（含），必须为正的有限值"
+    )
+    n_upper: float = Field(
+        gt=0, allow_inf_nan=False, description="候选折射率上界（含），必须为正的有限值"
+    )
+
+    @model_validator(mode="after")
+    def bounds_and_index_valid(self) -> "RefractiveIndexCalibrationRequest":
+        if self.n_lower >= self.n_upper:
+            raise ValueError("折射率下界必须严格小于上界（n_lower < n_upper）")
+        if self.target_interface_index >= len(self.interfaces):
+            raise ValueError(
+                f"待标定界面序号 {self.target_interface_index} 超出界面范围 "
+                f"0..{len(self.interfaces) - 1}"
+            )
+        return self
+
+
+class CalibrationScanPointOut(BaseModel):
+    """一个扫描折射率：候选 n_next、是否全部样本有效与均方残差（无效时 null）。"""
+
+    n_next: float
+    valid: bool
+    mean_squared_residual: float | None
+
+
+class CalibrationRefinedPointOut(BaseModel):
+    """低谷区间黄金分割细化得到的一个有效试点。"""
+
+    n_next: float
+    mean_squared_residual: float
+
+
+class CalibrationRayResultOut(BaseModel):
+    """最优折射率下单条样本光线的预测偏移与残差。"""
+
+    direction: Vec2
+    measured_offset: float
+    observation_point: Vec2
+    predicted_offset: float
+    residual: float
+
+
+class CalibrationBestOut(BaseModel):
+    """最优标定结果：折射率、均方残差与逐光线预测偏移和残差。"""
+
+    n_next: float
+    mean_squared_residual: float
+    rays: list[CalibrationRayResultOut]
+
+
+class RefractiveIndexCalibrationOut(BaseModel):
+    ray_count: int
+    target_interface_index: int
+    n_lower: float
+    n_upper: float
+    scan_count: int
+    tangent: Vec2
+    solvable: bool
+    reason: str | None
+    scan: list[CalibrationScanPointOut]
+    refined: list[CalibrationRefinedPointOut]
+    best: CalibrationBestOut | None

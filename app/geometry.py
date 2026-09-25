@@ -20,6 +20,9 @@ AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
 FOCUS_MIN_HITS = 2  # 扫描/细化位置有效所需的最少命中光线数
 FOCUS_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
 
+CALIBRATION_SCAN_COUNT = 41  # 折射率区间含端点等距扫描点数
+CALIBRATION_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
+
 WAVEFRONT_MIN_FIT_RAYS = 3  # 波前光程直线拟合所需的最少有效光线数
 # 黄金分割内点位置：左内点系数 1/φ²≈0.381966，右内点系数 1/φ≈0.618034
 _GOLDEN_TAU = (math.sqrt(5.0) - 1.0) / 2.0  # 1/φ ≈ 0.618034
@@ -790,5 +793,180 @@ def focus_search(
             (p.shift, len(p.hit_indices), p.centroid, p.rms)
             for _shift, p in refined_points
         ],
+        "best": best,
+    }
+
+
+@dataclass
+class _CalibrationPoint:
+    """目标界面取某候选折射率时，全部样本光线的标定结果。
+
+    仅当每条样本光线均追迹完成且出射段与观察线存在前向交点时有效；
+    mse 为各光线残差（预测切向偏移 − 实测偏移）平方的均值。
+    """
+
+    n_next: float
+    valid: bool
+    mse: float | None
+    ray_results: list[
+        tuple[tuple[float, float], float, tuple[float, float], float, float]
+    ]  # (direction, measured_offset, observation_point, predicted_offset, residual)
+
+
+def refractive_index_calibration(
+    start: tuple[float, float],
+    rays: list[tuple[tuple[float, float], float]],
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    target_index: int,
+    n_lower: float,
+    n_upper: float,
+) -> dict:
+    """固定其余界面、只替换目标界面的 n_next，按观察线切向偏移残差标定折射率。
+
+    观察线法线归一化后逆时针旋转 90° 得单位切向量 t；每条样本光线的预测偏移
+    为其出射段与观察线前向交点相对 obs_point 沿 t 的有符号距离，残差 =
+    预测偏移 − 实测偏移。仅当所有样本光线均追迹完成（completed）且与观察线
+    存在前向交点时，该候选折射率有效，均方残差 MSE = 残差平方的均值；任一
+    光线追迹失败或无前向交点则该候选无效。
+
+    在 [n_lower, n_upper]（含端点）等距扫描 CALIBRATION_SCAN_COUNT（41）个点；
+    对连续三个有效点，若中间点 MSE 不高于两端，则视为一个局部低谷，用黄金
+    分割法细化，最多 CALIBRATION_MAX_ROUNDS（24）轮（首轮取两个内点
+    lo+0.382L、lo+0.618L，此后每轮只新算一个内点）。细化试点一旦无效即停止
+    该低谷，此前的有效试点全部保留；不跨无效扫描点构造低谷。
+
+    以所有有效扫描点与细化点中 MSE 最小者为最佳，平局取较小折射率；没有
+    任何有效候选时 best 为 None。该函数为即时计算，不写入数据库。
+
+    返回 dict：
+      ray_count / scan_count / tangent；
+      scan:    [(n_next, valid, mse|None), ...]（按 n 升序，含无效点）；
+      refined: [(n_next, mse), ...]（有效细化点，按 n 升序）；
+      best:    (n_next, mse, ray_results) 或 None，ray_results 每条为
+               (direction, measured_offset, observation_point,
+               predicted_offset, residual)。
+    """
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+    sample_rays = [(normalize(direction), float(measured)) for direction, measured in rays]
+
+    cache: dict[float, _CalibrationPoint] = {}
+
+    def evaluate(n_next: float) -> _CalibrationPoint:
+        """替换目标界面折射率后逐条追迹，计算预测偏移与均方残差；同值只算一次。"""
+        if n_next in cache:
+            return cache[n_next]
+        trial = [
+            (pt, nm, n_next if i == target_index else nn)
+            for i, (pt, nm, nn) in enumerate(interfaces)
+        ]
+        ray_results: list[
+            tuple[tuple[float, float], float, tuple[float, float], float, float]
+        ] = []
+        valid = True
+        sq_sum = 0.0
+        for direction, measured in sample_rays:
+            segments, _status, _reason = trace_ray(start, direction, n_start, trial)
+            point = None
+            predicted: float | None = None
+            residual: float | None = None
+            if _status == "completed":
+                point = observation_intersection(segments, obs_point, obs_normal)
+                if point is not None:
+                    predicted = (
+                        (point[0] - obs_point[0]) * tangent[0]
+                        + (point[1] - obs_point[1]) * tangent[1]
+                    )
+                    residual = predicted - measured
+                    sq_sum += residual * residual
+            if point is None:
+                valid = False  # 有任一样本未完成追迹或未前向命中：候选无效
+            ray_results.append((direction, measured, point, predicted, residual))
+        mse = sq_sum / len(sample_rays) if valid else None
+        result = _CalibrationPoint(n_next, valid, mse, ray_results)
+        cache[n_next] = result
+        return result
+
+    # 等距扫描（含端点）
+    scan_points: list[_CalibrationPoint] = []
+    last = CALIBRATION_SCAN_COUNT - 1
+    for i in range(CALIBRATION_SCAN_COUNT):
+        n_next = n_lower if i == 0 else n_lower + (n_upper - n_lower) * i / last
+        scan_points.append(evaluate(n_next))
+
+    # 细化点池：仅记录非扫描位置的有效试点，用集合保证每点只入池一次
+    refined_points: list[tuple[float, _CalibrationPoint]] = []
+    refined_values: set[float] = set()
+    scan_values = {p.n_next for p in scan_points}
+
+    def probe(n_next: float) -> _CalibrationPoint | None:
+        """细化试点：有效时入池并返回；失效即返回 None 以停止该低谷。"""
+        fp = evaluate(n_next)
+        if fp.valid and n_next not in scan_values and n_next not in refined_values:
+            refined_values.add(n_next)
+            refined_points.append((n_next, fp))
+        if not fp.valid:
+            return None  # 试点失效：停止该低谷，已有有效试点全部保留
+        return fp
+
+    # 连续三个有效扫描点构成低谷：mse[mid] <= mse[lo] 且 <= mse[hi]
+    for i in range(len(scan_points) - 2):
+        p0, p1, p2 = scan_points[i], scan_points[i + 1], scan_points[i + 2]
+        if not (p0.valid and p1.valid and p2.valid):
+            continue  # 不跨无效扫描点
+        if not (p1.mse <= p0.mse and p1.mse <= p2.mse):
+            continue
+
+        lo, hi = p0.n_next, p2.n_next
+        # 左内点 a = lo + 0.382L，右内点 b = lo + 0.618L
+        a = lo + _GOLDEN_1MTAU * (hi - lo)
+        b = lo + _GOLDEN_TAU * (hi - lo)
+        fa = fb = None
+        for round_i in range(CALIBRATION_MAX_ROUNDS):
+            if round_i == 0:
+                # 首轮取两个内点；任一试点失效即停止，不再算另一个
+                fa = probe(a)
+                if fa is None:
+                    break
+                fb = probe(b)
+                if fb is None:
+                    break
+                continue
+            # 后续每轮只新算一个内点，另一个由上轮幸存点复用
+            if fa.mse <= fb.mse:
+                # 最小点偏左：新区间 [lo, b]；幸存点 a 变为新左内点，新算右内点
+                hi = b
+                b, fb = a, fa
+                a = lo + _GOLDEN_1MTAU * (hi - lo)
+                fa = probe(a)
+            else:
+                # 最小点偏右：新区间 [a, hi]；幸存点 b 变为新右内点，新算左内点
+                lo = a
+                a, fa = b, fb
+                b = lo + _GOLDEN_TAU * (hi - lo)
+                fb = probe(b)
+            if fa is None or fb is None:
+                break
+
+    # 以均方残差最小为最佳，平局取较小折射率
+    candidates: list[tuple[float, _CalibrationPoint]] = [
+        (p.n_next, p) for p in scan_points if p.valid
+    ]
+    candidates.extend(refined_points)
+    best: tuple[float, float, list] | None = None
+    if candidates:
+        best_n, best_fp = min(candidates, key=lambda item: (item[1].mse, item[0]))
+        best = (best_n, best_fp.mse, best_fp.ray_results)
+
+    refined_points.sort(key=lambda item: item[0])
+    return {
+        "ray_count": len(sample_rays),
+        "scan_count": CALIBRATION_SCAN_COUNT,
+        "tangent": tangent,
+        "scan": [(p.n_next, p.valid, p.mse) for p in scan_points],
+        "refined": [(n_next, p.mse) for n_next, p in refined_points],
         "best": best,
     }

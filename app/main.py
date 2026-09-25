@@ -30,6 +30,9 @@ POST /api/alignment-sensitivities     基准追迹后逐界面将法线旋转 ±
 POST /api/focus-searches              光线只追迹一次，将观察线沿单位法线等距平移
                                       扫描光斑质心/RMS，对命中集合相同的低谷区间
                                       黄金分割细化，返回 RMS 最小的焦点位置（不入库）
+POST /api/refractive-index-calibrations 固定其余界面只替换目标界面 n_next，沿观察线
+                                      切向偏移均方残差扫描 + 低谷黄金分割细化，
+                                      返回最优折射率与逐光线预测偏移/残差（不入库）
 """
 from __future__ import annotations
 
@@ -50,6 +53,7 @@ from .geometry import (
     optical_path_length,
     power_binning,
     ray_transmittance,
+    refractive_index_calibration,
     sample_directions,
     trace_ray,
     trace_ray_aperture,
@@ -69,6 +73,8 @@ from .schemas import (
     FocusSearchRequest,
     PowerEvaluationOut,
     PowerRequest,
+    RefractiveIndexCalibrationOut,
+    RefractiveIndexCalibrationRequest,
     SegmentOut,
     SensitivityRequest,
     TraceCompareRequest,
@@ -711,6 +717,100 @@ def compute_focus_searches(req: FocusSearchRequest) -> dict:
                     "y": result["best"][1][1],
                 },
                 "rms_radius": result["best"][2],
+            }
+        ),
+    }
+
+
+@app.post(
+    "/api/refractive-index-calibrations",
+    response_model=RefractiveIndexCalibrationOut,
+)
+def calibrate_refractive_index(req: RefractiveIndexCalibrationRequest) -> dict:
+    """固定其余界面、只替换目标界面 n_next，按观察线切向偏移残差标定折射率。
+
+    输入起点、至少两条发射方向及各自在观察线上的实测有符号切向偏移（沿观察线
+    单位切向量，即法线逆时针旋转 90°）、顺序界面、待标定界面序号与正折射率
+    上下界。复用现有顺序界面追迹与观察线求交：每个候选折射率只替换目标界面的
+    n_next（界面点、法线与其余界面固定不变），逐光线取完成追迹后的出射段与
+    观察线前向交点计算预测偏移，残差 = 预测偏移 − 实测偏移；仅当所有样本均
+    完成追迹且前向命中观察线时该候选有效，均方残差为各光线残差平方的均值。
+
+    在 [n_lower, n_upper] 含端点等距扫描 41 点；对连续三个有效点且中间点均方
+    残差不高于两端的局部低谷做黄金分割细化，最多 24 轮（首轮两个内点，此后
+    每轮只新算一个内点）；细化试点一旦失效即停止该低谷，此前的有效试点全部
+    保留。取所有有效扫描点与细化点中均方残差最小者，平局取较小折射率；没有
+    任何有效候选时 solvable 为 false、best 为 null 并给出明确原因。返回最优
+    折射率、均方残差及逐光线预测偏移和残差。该接口为即时计算，不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    rays = [
+        (ray.direction.as_tuple(), ray.measured_offset) for ray in req.rays
+    ]
+    result = refractive_index_calibration(
+        req.start.as_tuple(),
+        rays,
+        req.n_start,
+        interfaces,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.target_interface_index,
+        req.n_lower,
+        req.n_upper,
+    )
+    tangent = result["tangent"]
+    best = result["best"]
+    if best is None:
+        reason = (
+            "折射率区间 "
+            f"[{req.n_lower}, {req.n_upper}] 内不存在使所有 {result['ray_count']} "
+            "条样本光线均完成追迹且前向命中观察线的候选折射率，标定无解"
+        )
+    else:
+        reason = None
+    return {
+        "ray_count": result["ray_count"],
+        "target_interface_index": req.target_interface_index,
+        "n_lower": req.n_lower,
+        "n_upper": req.n_upper,
+        "scan_count": result["scan_count"],
+        "tangent": {"x": tangent[0], "y": tangent[1]},
+        "solvable": best is not None,
+        "reason": reason,
+        "scan": [
+            {
+                "n_next": n_next,
+                "valid": valid,
+                "mean_squared_residual": mse,
+            }
+            for n_next, valid, mse in result["scan"]
+        ],
+        "refined": [
+            {"n_next": n_next, "mean_squared_residual": mse}
+            for n_next, mse in result["refined"]
+        ],
+        "best": (
+            None
+            if best is None
+            else {
+                "n_next": best[0],
+                "mean_squared_residual": best[1],
+                "rays": [
+                    {
+                        "direction": {"x": direction[0], "y": direction[1]},
+                        "measured_offset": measured,
+                        "observation_point": {
+                            "x": point[0],
+                            "y": point[1],
+                        },
+                        "predicted_offset": predicted,
+                        "residual": residual,
+                    }
+                    for direction, measured, point, predicted, residual in best[2]
+                ],
             }
         ),
     }
